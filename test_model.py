@@ -41,8 +41,7 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
-from transformers import WhisperConfig, WhisperFeatureExtractor, WhisperTokenizer, CLIPConfig, CLIPProcessor
-
+from transformers import WhisperConfig, WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration, CLIPProcessor
 from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
@@ -143,11 +142,11 @@ def main():
     set_seed(training_args.seed)
     
     whisper_config = WhisperConfig.from_pretrained(model_args.whisper_model)
-
     finetune_whisper_config = FinetuneWhisperConfig(whisper_config.to_dict())
     # 4. Load tokenizer
     tokenizer = WhisperTokenizer.from_pretrained(model_args.whisper_model)
     tokenizer.set_prefix_tokens(language=model_args.language)
+    processor = WhisperProcessor.from_pretrained(model_args.whisper_model)
     extractor = WhisperFeatureExtractor.from_pretrained(model_args.whisper_model)
 
     ### 5. Load dataset
@@ -158,21 +157,20 @@ def main():
         tokenizer,
         processor,
     )
-
-
     # 6. Load pretrained model
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
 
 
-    model = FinetuneWhisperModel(finetune_whisper_config)
-    
+    # model = FinetuneWhisperModel(finetune_whisper_config).from_pretrained('checkpoints/librispeech-100')
+    # model = model.whisper_model
+    model = FinetuneWhisperModel.from_pretrained('/home/zth/work/new/Unconstrained-AVSR/checkpoints/now_how2_2')
+    # model = WhisperForConditionalGeneration.from_pretrained('pretrained_models/whisper-small')
+    model.config.keys_to_ignore_at_inference = ["past_key_values"]
     if finetune_whisper_config.freeze_whisper:
         for name, param in model.whisper_model.named_parameters():
             param.requires_grad = False
-    for name, param in model.clip_model.named_parameters():
-        param.requires_grad = False
 
     # 7. Define data collator
     data_collator = SpeechImgTextPairedDataCollator(
@@ -182,8 +180,6 @@ def main():
         extractor=extractor
     )
     
-    
-    
     metric = evaluate.load("wer")
     normalizer = BasicTextNormalizer()
     
@@ -192,45 +188,53 @@ def main():
         label_ids = pred.label_ids
 
         # replace -100 with the pad_token_id
-        label_ids[label_ids == -100] = tokenizer.pad_token_id
+        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
         # we do not want to group tokens when computing the metrics
-        pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+        pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
+        label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
 
-        pred_str = [normalizer(pred) for pred in pred_str]
-        label_str = [normalizer(label) for label in label_str]
+        # compute orthographic wer
+        wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
+        # compute normalised WER
+        pred_str_norm = [normalizer(pred) for pred in pred_str]
+        label_str_norm = [normalizer(label) for label in label_str]
+        # filtering step to only evaluate the samples that correspond to non-zero references:
+        pred_str_norm = [
+            pred_str_norm[i] for i in range(len(pred_str_norm)) if len(label_str_norm[i]) > 0
+        ]
+        label_str_norm = [
+            label_str_norm[i]
+            for i in range(len(label_str_norm))
+            if len(label_str_norm[i]) > 0
+        ]
 
-        wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-        return {"wer": wer}
+        wer = 100 * metric.compute(predictions=pred_str_norm, references=label_str_norm)
 
+        return {"wer_ortho": wer_ortho, "wer": wer}
+
+    def preprocess_logits_for_metrics(logits, labels):
+        """
+        Original Trainer may have a memory leak. 
+        This is a workaround to avoid storing too many tensors that are not needed.
+        """
+
+        pred_ids = torch.argmax(logits[1], dim=-1)
+        return pred_ids
+    
     # 7. Initialize Trainer
-    trainer = Seq2SeqTrainer(
+    tester = Seq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        data_collator=data_collator)
+        eval_dataset=dataset,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
 
     # 8. Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()
-        trainer.log_metrics("train", train_result.metrics)
-        trainer.save_metrics("train", train_result.metrics)
-        trainer.save_state()
-
-    results = {}
-    
-    # 9. Save tokenizer for inference load
-    tokenizer.save_pretrained(training_args.output_dir)
-    extractor.save_pretrained(training_args.output_dir)
-
-    return results
+    output = tester.evaluate()
+    print(output)
 
 if __name__ == "__main__":
     main()
